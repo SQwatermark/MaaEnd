@@ -1,15 +1,7 @@
 package autofight
 
 import (
-	"bytes"
-	"compress/gzip"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
-	"io"
 	"slices"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/i18n"
@@ -18,57 +10,30 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// 时间单位与游戏一致：60fps，prepDuration=300，因此战斗 t=0 对应 frame 300。
-// 上层只看 ultimate / skill 两类动作；Endaxis 的 battleSkill 与 skill 等价派发。
-// 其余 type（link / attack / comboSkill 等）不进入派发队列。
-const (
-	timelineFrameBase = 300
-	timelineFPS       = 60.0
-)
-
 // EndAxisAction 是从时间轴中提取出的一个待派发的 ultimate/skill 动作。
 type EndAxisAction struct {
-	Type      string // "ultimate" | "skill"（battleSkill 收集时已规范化为 skill）
-	TrackIdx  int    // 0..3，对应 scenario.data.tracks 的下标
-	StartTime int    // 帧（与 JSON 里 startTime 一致，基准 300）
-	Duration  int    // 帧
+	Type      string        // "ultimate" | "skill"
+	TrackIdx  int           // 队伍位置，从 0 开始；空轨道仍占一个位置。
+	StartTime time.Duration // 相对战斗开始的时间，已消除存档帧率和准备阶段偏移。
 	Name      string
 	ID        string
 }
 
-// 以下是仅用于反序列化 JSON 的精简结构，业务上只关心这几个字段，
-// 其余字段（damageTicks/equip/stats 等）均忽略。
-type timelineActionRaw struct {
-	Type      string `json:"type"`
-	StartTime int    `json:"startTime"`
-	Duration  int    `json:"duration"`
-	Name      string `json:"name"`
-	ID        string `json:"id"`
+type timelineScenario struct {
+	ID      string
+	Name    string
+	Actions []EndAxisAction
+	EndTime time.Duration
 }
 
-type timelineTrackRaw struct {
-	ID      string              `json:"id"`
-	Actions []timelineActionRaw `json:"actions"`
-}
-
-type timelineDataRaw struct {
-	Tracks []timelineTrackRaw `json:"tracks"`
-}
-
-type timelineScenarioRaw struct {
-	ID   string          `json:"id"`
-	Name string          `json:"name"`
-	Data timelineDataRaw `json:"data"`
-}
-
-type timelineRootRaw struct {
-	ScenarioList []timelineScenarioRaw `json:"scenarioList"`
+type timelineProject struct {
+	Scenarios []timelineScenario
 }
 
 // EndAxisTimeline 解析 Endaxis 时间轴数据码，并按时间轴派发 ultimate/skill 动作。
 //
 // 输入格式为 Endaxis（www.end-axis.com）网站"复制数据码"按钮生成的字符串：
-// 内层是与"导出 JSON"完全一致的项目数据，外层经过 gzip 压缩并使用 URL-safe
+// 同时支持旧版 scenarioList 与新版 EndaxisProject。内层为项目数据，外层经过 gzip 压缩并使用 URL-safe
 // base64（'+'→'-'、'/'→'_'、去掉尾随 '='）编码。
 //
 // 用法：
@@ -77,7 +42,7 @@ type timelineRootRaw struct {
 //	t.SetTimelineCode(code)
 //	if t.SelectScenario(ctx, characterCount, comboFull, endSkillFull, energy, skipComboCooldown) {
 //	    for !t.ActionFinish() {
-//	        if a, ok := t.FrontAction(); ok {
+//	        if a := t.FrontAction(); a != nil {
 //	            // ... 在外部执行该动作 ...
 //	            t.PopFrontAction()
 //	        }
@@ -87,17 +52,17 @@ type timelineRootRaw struct {
 // 时序：SelectScenario 成功后内部计时即开始；当 FrontAction 返回一个动作时，
 // 计时被自动暂停，直到 PopFrontAction 调用后再恢复。
 type EndAxisTimeline struct {
-	root        *timelineRootRaw
+	root        *timelineProject
 	selectedID  string
 	queue       []EndAxisAction
 	energyLevel int
 
 	started        bool          // SelectScenario 是否成功启动了时间轴
 	paused         bool          // 当前是否处于暂停（等待 PopFrontAction）
-	startReal      time.Time     // 时间轴起点的真实时间（即 SelectScenario 成功的瞬间，对应 frame=300）
+	startReal      time.Time     // 时间轴起点的真实时间（SelectScenario 成功的瞬间）
 	pausedAt       time.Time     // 当前这一段暂停的起始真实时间，仅在 paused=true 时有意义
 	pausedDuration time.Duration // 截至上次 resume，已累计的暂停总时长
-	endFrame       int           // 当前 scenario 内所有 action 的最晚结束帧 max(startTime + duration)
+	endTime        time.Duration // 解析层确定的方案结束时间
 }
 
 // NewEndAxisTimeline 返回一个空的时间轴对象，使用前需先调用 SetTimelineCode。
@@ -120,8 +85,8 @@ func (t *EndAxisTimeline) SetTimelineCode(code string) bool {
 		return false
 	}
 
-	var root timelineRootRaw
-	if err := json.Unmarshal(jsonBytes, &root); err != nil {
+	root, err := parseEndAxisProject(jsonBytes)
+	if err != nil {
 		log.Error().
 			Err(err).
 			Str("component", "EndAxisTimeline").
@@ -132,45 +97,13 @@ func (t *EndAxisTimeline) SetTimelineCode(code string) bool {
 		return false
 	}
 
-	t.root = &root
+	t.root = root
 	t.reset()
 	log.Info().
 		Str("component", "EndAxisTimeline").
-		Int("scenarioCount", len(root.ScenarioList)).
+		Int("scenarioCount", len(root.Scenarios)).
 		Msg("timeline share code loaded")
 	return true
-}
-
-// decodeEndAxisShareCode 把 Endaxis "复制数据码" 生成的字符串还原成项目 JSON。
-// 网站侧的生成流程见 src/utils/gzipUtils.js：JSON.stringify → gzip → base64
-// 后再做 '+'→'-'、'/'→'_'、去掉尾随 '=' 三项替换；这里执行其逆操作。
-func decodeEndAxisShareCode(code string) ([]byte, error) {
-	trimmed := strings.TrimRight(strings.TrimSpace(code), "=")
-	if trimmed == "" {
-		return nil, fmt.Errorf("empty share code")
-	}
-
-	compressed, err := base64.RawURLEncoding.DecodeString(trimmed)
-	if err != nil {
-		return nil, fmt.Errorf("base64url decode: %w", err)
-	}
-
-	gr, err := gzip.NewReader(bytes.NewReader(compressed))
-	if err != nil {
-		return nil, fmt.Errorf("gzip reader: %w", err)
-	}
-	defer gr.Close()
-
-	const maxPlainSize = 5 << 20 // 5 MiB
-	lr := io.LimitReader(gr, maxPlainSize+1)
-	plain, err := io.ReadAll(lr)
-	if err != nil {
-		return nil, fmt.Errorf("gzip read: %w", err)
-	}
-	if len(plain) > maxPlainSize {
-		return nil, fmt.Errorf("share code payload too large (>%d bytes)", maxPlainSize)
-	}
-	return plain, nil
 }
 
 // SelectScenario 根据当前队伍状态挑选一个匹配的 scenario，并启动时间轴。
@@ -191,7 +124,7 @@ func decodeEndAxisShareCode(code string) ([]byte, error) {
 //  2. 对每个 scenario，逐个 track i ∈ [0, characterCount) 检查：若该 track 含 type==ultimate
 //     的 action，则对应角色编号 i+1 必须在 endSkillFull 列表中；任一项不满足则跳过该
 //     scenario，并通过 maafocus.PrintThrottle（3s）输出"终结技未充能完毕"的提示；
-//  3. scenario 内若没有任何 type==ultimate / skill / battleSkill 的 action（即没有可派发的动作），
+//  3. scenario 内若没有可派发的 ultimate / skill 动作，
 //     也跳过该 scenario，并通过 maafocus.PrintThrottle（3s）输出"没有战技或终结技"的提示；
 //  4. 所有 scenario 都不满足时返回 false。
 //
@@ -217,8 +150,8 @@ func (t *EndAxisTimeline) SelectScenario(ctx *maa.Context, characterCount int, c
 		}
 	}
 
-	for i := range t.root.ScenarioList {
-		sc := &t.root.ScenarioList[i]
+	for i := range t.root.Scenarios {
+		sc := &t.root.Scenarios[i]
 		if !scenarioMatchesEndSkill(sc, endSkillFull, characterCount) {
 			log.Debug().
 				Str("component", "EndAxisTimeline").
@@ -230,7 +163,7 @@ func (t *EndAxisTimeline) SelectScenario(ctx *maa.Context, characterCount int, c
 			continue
 		}
 
-		actions := collectTimelineActions(sc)
+		actions := sc.Actions
 		if len(actions) == 0 {
 			log.Debug().
 				Str("component", "EndAxisTimeline").
@@ -243,13 +176,13 @@ func (t *EndAxisTimeline) SelectScenario(ctx *maa.Context, characterCount int, c
 		}
 
 		t.selectedID = sc.ID
-		t.queue = actions
+		t.queue = slices.Clone(actions)
 		t.energyLevel = energyLevel
 		t.started = true
 		t.paused = false
 		t.startReal = time.Now()
 		t.pausedDuration = 0
-		t.endFrame = computeTimelineEndFrame(sc)
+		t.endTime = sc.EndTime
 
 		log.Info().
 			Str("component", "EndAxisTimeline").
@@ -257,7 +190,7 @@ func (t *EndAxisTimeline) SelectScenario(ctx *maa.Context, characterCount int, c
 			Str("scenarioId", sc.ID).
 			Str("scenarioName", sc.Name).
 			Int("actionCount", len(t.queue)).
-			Int("endFrame", t.endFrame).
+			Dur("endTime", t.endTime).
 			Int("energyLevel", energyLevel).
 			Msg("scenario selected")
 		maafocus.Print(ctx, i18n.T("autofight.endaxis.scenario_selected", sc.Name))
@@ -267,20 +200,20 @@ func (t *EndAxisTimeline) SelectScenario(ctx *maa.Context, characterCount int, c
 	log.Debug().
 		Str("component", "EndAxisTimeline").
 		Str("step", "SelectScenario").
-		Int("scenarioCount", len(t.root.ScenarioList)).
+		Int("scenarioCount", len(t.root.Scenarios)).
 		Msg("no matching scenario")
 	maafocus.PrintThrottle(ctx, 3*time.Second, i18n.T("autofight.endaxis.no_matching_scenario"))
 	return false
 }
 
-// FrontAction 返回当前帧应触发的队首 ultimate/skill 动作。
+// FrontAction 返回当前时刻应触发的队首 ultimate/skill 动作。
 // 命中时会自动暂停内部计时，直到 PopFrontAction 调用后再恢复。
-// 未到时间或队列为空时返回 nil, false。
+// 未到时间或队列为空时返回 nil。
 func (t *EndAxisTimeline) FrontAction() *EndAxisAction {
 	if !t.started || len(t.queue) == 0 {
 		return nil
 	}
-	if t.queue[0].StartTime > t.currentFrame() {
+	if t.queue[0].StartTime > t.currentTime() {
 		return nil
 	}
 
@@ -304,7 +237,7 @@ func (t *EndAxisTimeline) PopFrontAction() {
 		Str("step", "PopFrontAction").
 		Str("type", popped.Type).
 		Int("trackIdx", popped.TrackIdx).
-		Int("startTime", popped.StartTime).
+		Dur("startTime", popped.StartTime).
 		Int("remaining", len(t.queue)).
 		Msg("action popped")
 }
@@ -312,7 +245,7 @@ func (t *EndAxisTimeline) PopFrontAction() {
 // ActionFinish 返回当前 scenario 的时间轴是否已经结束。
 // 同时满足两个条件才视为结束：
 //  1. 派发队列已空（所有 ultimate/skill 都已 Pop）；
-//  2. 当前逻辑帧已经走到该 scenario 内所有 action 的最晚结束帧。
+//  2. 当前逻辑时间已到解析层确定的方案结束时间。
 //
 // 这样可以避免最后一个 ultimate/skill Pop 完后立刻进入下一次 SelectScenario，
 // 留出 scenario 末尾普攻/位移等动作所占用的时间窗口。
@@ -323,10 +256,10 @@ func (t *EndAxisTimeline) ActionFinish() bool {
 	if len(t.queue) > 0 {
 		return false
 	}
-	return t.currentFrame() >= t.endFrame
+	return t.currentTime() >= t.endTime
 }
 
-// reset 清空运行时状态，但不清空 root（已加载的 JSON）。
+// reset 清空运行时状态，但保留已解析的方案。
 func (t *EndAxisTimeline) reset() {
 	t.selectedID = ""
 	t.queue = nil
@@ -336,20 +269,19 @@ func (t *EndAxisTimeline) reset() {
 	t.startReal = time.Time{}
 	t.pausedAt = time.Time{}
 	t.pausedDuration = 0
-	t.endFrame = 0
+	t.endTime = 0
 }
 
-// currentFrame 返回当前逻辑帧。
-// 逻辑帧 = 基准帧(300) + (真实流逝时间 - 累计暂停时长) 换算成的帧数。
-func (t *EndAxisTimeline) currentFrame() int {
+// currentTime 返回扣除等待派发暂停时间后的逻辑时间。
+func (t *EndAxisTimeline) currentTime() time.Duration {
 	if !t.started {
 		return 0
 	}
-	elapsed := time.Since(t.startReal) - t.pausedDuration
+	now := time.Now()
 	if t.paused {
-		elapsed -= time.Since(t.pausedAt)
+		now = t.pausedAt
 	}
-	return timelineFrameBase + int(elapsed.Seconds()*timelineFPS)
+	return now.Sub(t.startReal) - t.pausedDuration
 }
 
 func (t *EndAxisTimeline) pause() {
@@ -372,74 +304,11 @@ func (t *EndAxisTimeline) resume() {
 // 只要 track i（i ∈ [0, characterCount)）内含 type==ultimate 的 action，
 // 对应的角色编号 i+1 就必须出现在 endSkillFull 列表中。
 // 超出 characterCount 的 track（队伍里没有对应角色）一律忽略。
-func scenarioMatchesEndSkill(sc *timelineScenarioRaw, endSkillFull []int, characterCount int) bool {
-	for i := 0; i < characterCount; i++ {
-		if i >= len(sc.Data.Tracks) {
-			continue
-		}
-		if !trackHasUltimate(&sc.Data.Tracks[i]) {
-			continue
-		}
-		if !slices.Contains(endSkillFull, i+1) {
+func scenarioMatchesEndSkill(sc *timelineScenario, endSkillFull []int, characterCount int) bool {
+	for _, action := range sc.Actions {
+		if action.TrackIdx < characterCount && action.Type == "ultimate" && !slices.Contains(endSkillFull, action.TrackIdx+1) {
 			return false
 		}
 	}
 	return true
-}
-
-func trackHasUltimate(track *timelineTrackRaw) bool {
-	for i := range track.Actions {
-		if track.Actions[i].Type == "ultimate" {
-			return true
-		}
-	}
-	return false
-}
-
-// computeTimelineEndFrame 扫描 scenario 内所有 track 的所有 action（不限制 type），
-// 返回 max(startTime + duration)，即整条时间轴的最晚结束帧。
-// 没有任何 action 时返回 timelineFrameBase，使 ActionFinish 立即可结束。
-func computeTimelineEndFrame(sc *timelineScenarioRaw) int {
-	end := timelineFrameBase
-	for _, track := range sc.Data.Tracks {
-		for _, a := range track.Actions {
-			if stop := a.StartTime + a.Duration; stop > end {
-				end = stop
-			}
-		}
-	}
-	return end
-}
-
-// collectTimelineActions 从 scenario 的 4 条 track 中抽取所有 ultimate/skill 动作，
-// 并按 startTime 升序合并为一个全局派发队列。battleSkill 与 skill 等价，统一为 skill。
-func collectTimelineActions(sc *timelineScenarioRaw) []EndAxisAction {
-	var out []EndAxisAction
-	for trackIdx, track := range sc.Data.Tracks {
-		for _, a := range track.Actions {
-			actionType := a.Type
-			switch actionType {
-			case "battleSkill":
-				actionType = "skill"
-			case "ultimate", "skill":
-			default:
-				continue
-			}
-			out = append(out, EndAxisAction{
-				Type:      actionType,
-				TrackIdx:  trackIdx,
-				StartTime: a.StartTime,
-				Duration:  a.Duration,
-				Name:      a.Name,
-				ID:        a.ID,
-			})
-		}
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].StartTime != out[j].StartTime {
-			return out[i].StartTime < out[j].StartTime
-		}
-		return out[i].TrackIdx < out[j].TrackIdx
-	})
-	return out
 }
